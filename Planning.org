@@ -1,0 +1,7 @@
+#+TITLE: Busboy
+* Time 2
+  Would like to try this again but in Haskell, and focus on storing the data
+  just for one stop better first.
+
+  I do wonder whether I should just do it in Python instead, since I already
+  have the code :/ Nah, it’s not as fun :P
