@@ -1,7 +1,8 @@
 { mkDerivation, aeson, async, base, bytestring, containers
 , generic-lens, http-client, http-client-tls, lens, lib, lucid
 , optparse-applicative, scientific, servant, servant-client
-, servant-lucid, servant-server, text, time, vector, wai, warp
+, servant-lucid, servant-server, sqlite-simple, text, time, vector
+, wai, warp
 }:
 mkDerivation {
   pname = "busboy";
@@ -12,7 +13,8 @@ mkDerivation {
   libraryHaskellDepends = [
     aeson async base bytestring containers generic-lens http-client
     http-client-tls lens lucid scientific servant servant-client
-    servant-lucid servant-server text time vector wai warp
+    servant-lucid servant-server sqlite-simple text time vector wai
+    warp
   ];
   executableHaskellDepends = [
     aeson base bytestring containers http-client http-client-tls lucid
@@ -26,4 +28,5 @@ mkDerivation {
   ];
   homepage = "https://github.com/undergroundquizscene/busboy#readme";
   license = lib.licenses.bsd3;
+  mainProgram = "busboy-exe";
 }

@@ -23,6 +23,7 @@ library
   exposed-modules:
       Lib
   other-modules:
+      Database
       Paths_busboy
   hs-source-dirs:
       src
@@ -42,6 +43,7 @@ library
       servant-client,
       servant-lucid,
       servant-server,
+      sqlite-simple,
       text,
       time,
       vector,

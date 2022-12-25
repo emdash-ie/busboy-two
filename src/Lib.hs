@@ -49,6 +49,8 @@ import Data.Time.Clock (UTCTime, secondsToNominalDiffTime, getCurrentTime)
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Data.Vector (Vector)
 import qualified Data.Vector as Vector
+import qualified Data.Map.Strict as Map
+import qualified Database.SQLite.Simple as SQLite
 import GHC.Generics (Generic)
 import qualified Lucid
 import Lucid hiding (type_)
@@ -64,7 +66,8 @@ import Servant.Client (ClientM, client, runClientM, mkClientEnv, Scheme(..), Bas
 import Control.Monad.IO.Class (liftIO)
 import Data.Char (isDigit)
 import GHC.Conc (TVar, readTVarIO, readTVar, writeTVar, newTVarIO, newTVar, forkIO, atomically, threadDelay)
-import qualified Data.Map.Strict as Map
+
+import qualified Database
 
 callStopPassage :: IO ()
 callStopPassage = do
@@ -348,7 +351,7 @@ data Location = Location
   , lastModified :: MillisTimestamp
   } deriving (Show, Eq)
 
--- | Recorded when it changes. One per vehicle.
+-- | Recorded when it changes.
 data VehicleInfo = VehicleInfo
   { retrievedAt :: UTCTime
   , vehicleId :: VehicleId
@@ -356,7 +359,7 @@ data VehicleInfo = VehicleInfo
   , hasBikeRack :: Bool
   }
 
--- | Recorded when it changes. One per passage.
+-- | Recorded when it changes.
 data PassageInfo = PassageInfo
   { id :: PassageId
   , retrievedAt :: UTCTime
@@ -391,8 +394,9 @@ busboyAPI = Proxy
 busboyApp :: ServerState -> Application
 busboyApp = serve busboyAPI . busboyServer
 
-runBusboyApp :: IO ()
-runBusboyApp = do
+runBusboyApp :: FilePath -> IO ()
+runBusboyApp databasePath = do
+  SQLite.withConnection databasePath Database.createTables
   var <- newTVarIO Map.empty
   forkIO (queryBusEireann (ServerState var))
   run 9999 (busboyApp (ServerState var))
