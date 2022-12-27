@@ -35,7 +35,6 @@ createLocationTable =
   \ , congestionLevel tinyint null \
   \ , accuracyLevel tinyint null \
   \ , lastModified text \
-  \ , primary key (retrievedAt, vehicleId) \
   \ )"
 
 createVehiclesTable :: Query
