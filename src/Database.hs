@@ -15,12 +15,13 @@ createPredictionTable =
   "create table if not exists predictions \
   \ ( retrievedAt text \
   \ , passageId text \
+  \ , stopId text \
   \ , lastModified text \
   \ , scheduledArrivalTime text null \
   \ , actualOrEstimatedArrivalTime text null \
   \ , scheduledDepartureTime text null \
   \ , actualOrEstimatedDepartureTime text null \
-  \ , primary key (retrievedAt, passageId) \
+  \ , primary key (retrievedAt, passageId, stopId) \
   \ )"
 
 createLocationTable :: Query
@@ -31,8 +32,8 @@ createLocationTable =
   \ , latitude integer \
   \ , longitude integer \
   \ , bearing smallint \
-  \ , congestionLevel tinyint \
-  \ , accuracyLevel tinyint \
+  \ , congestionLevel tinyint null \
+  \ , accuracyLevel tinyint null \
   \ , lastModified text \
   \ , primary key (retrievedAt, vehicleId) \
   \ )"
@@ -42,8 +43,8 @@ createVehiclesTable =
   "create table if not exists vehicles \
   \ ( retrievedAt text \
   \ , vehicleId text \
-  \ , isAccessible boolean \
-  \ , hasBikeRack boolean \
+  \ , isAccessible boolean null \
+  \ , hasBikeRack boolean null \
   \ )"
 
 createPassagesTable :: Query
@@ -54,5 +55,5 @@ createPassagesTable =
   \ , tripId text \
   \ , routeId text \
   \ , stopId text \
-  \ , vehicleId text \
+  \ , vehicleId text null \
   \ )"

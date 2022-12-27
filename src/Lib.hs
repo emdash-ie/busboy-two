@@ -22,19 +22,23 @@ module Lib
     , writeRouteStopMaps
     ) where
 
+import Control.Applicative (liftA2)
 import Control.Concurrent.Async (mapConcurrently)
+import Control.Exception (catch, throw)
 import Control.Lens ((^.))
 import Control.Monad (join)
 import Data.Aeson as Aeson
 import Data.Aeson.Types (Parser)
 import qualified Data.ByteString.Lazy as LazyByteString
+import Data.Coerce (coerce)
 import Data.Either (fromRight)
 import Data.Fixed (Fixed(..))
 import Data.Foldable (traverse_)
+import Data.Function ((&))
 import Data.Functor (void)
 import Data.Generics.Product (field)
 import Data.List (intersperse, sortOn)
-import Data.Maybe (catMaybes, isJust)
+import Data.Maybe (catMaybes, isJust, mapMaybe)
 import Data.Map.Strict (Map)
 import Data.Proxy
 import Data.Set (Set)
@@ -51,10 +55,12 @@ import Data.Vector (Vector)
 import qualified Data.Vector as Vector
 import qualified Data.Map.Strict as Map
 import qualified Database.SQLite.Simple as SQLite
+import Database.SQLite.Simple (SQLData(..))
+import qualified Database.SQLite.Simple.ToField as SQLite
 import GHC.Generics (Generic)
 import qualified Lucid
 import Lucid hiding (type_)
-import Network.HTTP.Client (newManager, Manager)
+import Network.HTTP.Client (newManager, Manager, managerModifyRequest, responseTimeout, responseTimeoutMicro)
 import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Network.Wai (Application)
 import Network.Wai.Handler.Warp (run)
@@ -306,19 +312,19 @@ instance ToHtml StopPage where
 
   toHtmlRaw = toHtml
 
-dataCollector :: IO ()
-dataCollector = do
-  var <- newTVarIO initialState
-  forkIO (collectData var)
-  run 9999 (dataCollectorApp var)
-  where
-    initialState :: DataCollectorState
-    initialState = DataCollectorState
-      { predictions = Vector.empty
-      , locations = Vector.empty
-      , vehicles = Map.empty
-      , passages = Map.empty
-      }
+-- dataCollector :: IO ()
+-- dataCollector = do
+--   var <- newTVarIO initialState
+--   forkIO (collectData var)
+--   run 9999 (dataCollectorApp var)
+--   where
+--     initialState :: DataCollectorState
+--     initialState = DataCollectorState
+--       { predictions = Vector.empty
+--       , locations = Vector.empty
+--       , vehicles = Map.empty
+--       , passages = Map.empty
+--       }
 
 data DataCollectorState = DataCollectorState
   { predictions :: Vector Prediction
@@ -332,12 +338,25 @@ data DataCollectorState = DataCollectorState
 data Prediction = Prediction
   { retrievedAt :: UTCTime
   , passageId :: PassageId
+  , stopId :: StopId
   , lastModified :: MillisTimestamp
   , scheduledArrivalTime :: Maybe SecondsTimestamp
-  , actualOrEstimatedArivalTime :: Maybe SecondsTimestamp
+  , actualOrEstimatedArrivalTime :: Maybe SecondsTimestamp
   , scheduledDepartureTime :: Maybe SecondsTimestamp
   , actualOrEstimatedDepartureTime :: Maybe SecondsTimestamp
   } deriving (Show, Eq)
+
+instance SQLite.ToRow Prediction where
+  toRow Prediction{..} =
+    [ SQLite.toField retrievedAt
+    , SQLText (coerce passageId)
+    , SQLText (coerce stopId)
+    , SQLite.toField (coerce lastModified :: UTCTime)
+    , SQLite.toField (coerce scheduledArrivalTime :: Maybe UTCTime)
+    , SQLite.toField (coerce actualOrEstimatedArrivalTime :: Maybe UTCTime)
+    , SQLite.toField (coerce scheduledDepartureTime :: Maybe UTCTime)
+    , SQLite.toField (coerce actualOrEstimatedDepartureTime :: Maybe UTCTime)
+    ]
 
 -- | Recorded every time it's measured. One per vehicle.
 data Location = Location
@@ -346,18 +365,38 @@ data Location = Location
   , latitude :: Integer
   , longitude :: Integer
   , bearing :: Integer
-  , congestionLevel :: Integer
-  , accuracyLevel :: Integer
+  , congestionLevel :: Maybe Integer
+  , accuracyLevel :: Maybe Integer
   , lastModified :: MillisTimestamp
   } deriving (Show, Eq)
+
+instance SQLite.ToRow Location where
+  toRow Location{..} =
+    [ SQLite.toField retrievedAt
+    , SQLText (coerce vehicleId)
+    , SQLite.toField latitude
+    , SQLite.toField longitude
+    , SQLite.toField bearing
+    , SQLite.toField congestionLevel
+    , SQLite.toField accuracyLevel
+    , SQLite.toField (coerce lastModified :: UTCTime)
+    ]
 
 -- | Recorded when it changes.
 data VehicleInfo = VehicleInfo
   { retrievedAt :: UTCTime
   , vehicleId :: VehicleId
-  , isAccessible :: Bool
-  , hasBikeRack :: Bool
+  , isAccessible :: Maybe Bool
+  , hasBikeRack :: Maybe Bool
   }
+
+instance SQLite.ToRow VehicleInfo where
+  toRow VehicleInfo{..} =
+    [ SQLite.toField retrievedAt
+    , SQLText (coerce vehicleId)
+    , SQLite.toField isAccessible
+    , SQLite.toField hasBikeRack
+    ]
 
 -- | Recorded when it changes.
 data PassageInfo = PassageInfo
@@ -366,15 +405,56 @@ data PassageInfo = PassageInfo
   , tripId :: TripId
   , routeId :: RouteId
   , stopId :: StopId
-  , vehicleId :: VehicleId
+  , vehicleId :: Maybe VehicleId
   }
 
-collectData :: TVar DataCollectorState -> IO ()
-collectData =
+instance SQLite.ToRow PassageInfo where
+  toRow PassageInfo{..} =
+    [ SQLText (coerce id)
+    , SQLite.toField retrievedAt
+    , SQLText (coerce tripId)
+    , SQLText (coerce routeId)
+    , SQLText (coerce stopId)
+    , SQLite.toField (coerce vehicleId :: Maybe Text)
+    ]
+
+collectData :: Manager -> SQLite.Connection -> IO ()
+collectData manager connection = do
   -- for each stop on the 220 route:
   -- - poll the stopPassage endpoint
   -- - save retrieved info into the state variable
-  undefined
+  StopPassageResponse passages <- liftIO (getStopPassages (Just manager) churchCrossEast)
+  now <- getCurrentTime
+  let retrievedAt = now
+  let predictions :: [Prediction] = Vector.toList passages &
+        mapMaybe (\Passage{..} -> do
+                     let passageId = id
+                     (scheduledArrivalTime, actualOrEstimatedArrivalTime) <- do
+                       td <- arrival
+                       return (td ^. field @"scheduledPassageTime", td ^. field @"actualPassageTime")
+                     (scheduledDepartureTime, actualOrEstimatedDepartureTime) <- do
+                       td <- departure
+                       return (td ^. field @"scheduledPassageTime", td ^. field @"actualPassageTime")
+                     return Prediction{..})
+  let locations :: [Location] = Vector.toList passages &
+        mapMaybe (\Passage{..} -> do
+                     vehicleId' <- vehicleId
+                     return Location{vehicleId = vehicleId', ..})
+  let vehicleInfo :: [VehicleInfo] = Vector.toList passages &
+        mapMaybe (\Passage{..} -> do
+                     vehicleId' <- vehicleId
+                     return VehicleInfo
+                       { vehicleId = vehicleId'
+                       , isAccessible = coerce isAccessible
+                       , hasBikeRack = coerce hasBikeRack
+                       , retrievedAt
+                       })
+  let passageInfo :: [PassageInfo] = Vector.toList passages &
+        fmap (\Passage{..} -> PassageInfo{..})
+  SQLite.executeMany connection "insert into predictions values (?, ?, ?, ?, ?, ?, ?, ?)" predictions
+  SQLite.executeMany connection "insert into locations values (?, ?, ?, ?, ?, ?, ?, ?)" locations
+  SQLite.executeMany connection "insert into vehicles values (?, ?, ?, ?)" vehicleInfo -- should be an upsert?
+  SQLite.executeMany connection "insert into passages values (?, ?, ?, ?, ?, ?)" passageInfo -- should be an upsert?
 
 dataCollectorApp :: TVar DataCollectorState -> Application
 dataCollectorApp =
@@ -396,9 +476,18 @@ busboyApp = serve busboyAPI . busboyServer
 
 runBusboyApp :: FilePath -> IO ()
 runBusboyApp databasePath = do
-  SQLite.withConnection databasePath Database.createTables
+  forkIO (SQLite.withConnection databasePath (\connection -> do
+    let managerSettings = tlsManagerSettings
+          { managerModifyRequest = \r -> return (r {responseTimeout = responseTimeoutMicro 10000000}) -- 10 seconds
+          }
+    manager <- newManager managerSettings
+    Database.createTables connection
+    let loop f = do
+          f
+          threadDelay 10000000 -- 10 seconds
+          loop f
+    loop (collectData manager connection)))
   var <- newTVarIO Map.empty
-  forkIO (queryBusEireann (ServerState var))
   run 9999 (busboyApp (ServerState var))
 
 queryBusEireann :: ServerState -> IO ()
@@ -616,7 +705,7 @@ data TimingData = TimingData
   , directionText :: Text
   , serviceMode :: Integer
   , type_ :: Integer
-  } deriving (Show, Eq)
+  } deriving (Show, Eq, Generic)
 
 instance FromJSON TimingData where
   parseJSON = withObject "TimingData" $ \o -> do
