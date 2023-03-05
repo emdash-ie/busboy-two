@@ -3,6 +3,7 @@
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE DuplicateRecordFields #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
@@ -26,7 +27,7 @@ import Control.Applicative (liftA2)
 import Control.Concurrent.Async (mapConcurrently)
 import Control.Exception (catch, throw)
 import Control.Lens ((^.), to, _1)
-import Control.Monad (join, when, unless)
+import Control.Monad (join, when, unless, guard)
 import Data.Aeson as Aeson
 import Data.Aeson.Types (Parser)
 import qualified Data.ByteString.Lazy as LazyByteString
@@ -339,8 +340,7 @@ data DataCollectorState = DataCollectorState
   , passages :: Map PassageId (Set PassageInfo)
   }
 
--- | Recorded every time it's measured, because it's useful to know when the
--- prediction hasn't changed. One per passage.
+-- | Recorded when it’s changed. One per passage.
 data Prediction = Prediction
   { retrievedAt :: UTCTime
   , passageId :: PassageId
@@ -350,7 +350,7 @@ data Prediction = Prediction
   , actualOrEstimatedArrivalTime :: Maybe SecondsTimestamp
   , scheduledDepartureTime :: Maybe SecondsTimestamp
   , actualOrEstimatedDepartureTime :: Maybe SecondsTimestamp
-  } deriving (Show, Eq)
+  } deriving (Show, Eq, Generic)
 
 instance SQLite.ToRow Prediction where
   toRow Prediction{..} =
@@ -363,6 +363,17 @@ instance SQLite.ToRow Prediction where
     , SQLite.toField (coerce scheduledDepartureTime :: Maybe UTCTime)
     , SQLite.toField (coerce actualOrEstimatedDepartureTime :: Maybe UTCTime)
     ]
+
+instance SQLite.FromRow Prediction where
+  fromRow = Prediction
+    <$> SQLite.field
+    <*> SQLite.field
+    <*> SQLite.field
+    <*> SQLite.field
+    <*> SQLite.field
+    <*> SQLite.field
+    <*> SQLite.field
+    <*> SQLite.field
 
 -- | Recorded every time it's measured. One per vehicle.
 data Location = Location
@@ -476,23 +487,35 @@ collectData manager connection = do
     StopPassageResponse tripPassages <- liftIO (getStopPassages (Just manager) (Right trip))
     now <- getCurrentTime
     let retrievedAt = now
-    let predictions :: [Prediction] = Vector.toList tripPassages &
-          mapMaybe (\Passage{..} -> do
-                       let passageId = id
-                       (scheduledArrivalTime, actualOrEstimatedArrivalTime) <- do
-                         td <- arrival
-                         return (td ^. field @"scheduledPassageTime", td ^. field @"actualPassageTime")
-                       (scheduledDepartureTime, actualOrEstimatedDepartureTime) <- do
-                         td <- departure
-                         return (td ^. field @"scheduledPassageTime", td ^. field @"actualPassageTime")
-                       return Prediction{..})
-    SQLite.executeMany connection "insert into predictions values (?, ?, ?, ?, ?, ?, ?, ?)" predictions
+    mostRecentPredictions :: Map (PassageId, StopId) Prediction <- fmap (Map.fromListWith (maxBy (comparing (^. field @"retrievedAt")))
+                                  . fmap (\p@Prediction{passageId, stopId} -> ((passageId, stopId), p)))
+                             (SQLite.query_ connection
+                             "select * from predictions" :: IO [Prediction])
+    let predictionsToInsert :: [Prediction] = Vector.toList tripPassages &
+          mapMaybe (\p@Passage{..} -> do
+            let passageId = id
+            (scheduledArrivalTime, actualOrEstimatedArrivalTime) <- do
+              td <- arrival
+              return (td ^. field @"scheduledPassageTime", td ^. field @"actualPassageTime")
+            (scheduledDepartureTime, actualOrEstimatedDepartureTime) <- do
+              td <- departure
+              return (td ^. field @"scheduledPassageTime", td ^. field @"actualPassageTime")
+            let prediction = Prediction{..}
+            let passageSubfields p =
+                  ( p ^. field @"lastModified"
+                   , p ^. field @"scheduledArrivalTime"
+                   , p ^. field @"actualOrEstimatedArrivalTime"
+                   , p ^. field @"scheduledDepartureTime"
+                   , p ^. field @"actualOrEstimatedDepartureTime"
+                   )
+            guard (maybe
+                  True
+                   ((passageSubfields prediction /=) . passageSubfields)
+                   (Map.lookup (passageId, stopId) mostRecentPredictions))
+            return Prediction{..})
+    SQLite.executeMany connection "insert into predictions values (?, ?, ?, ?, ?, ?, ?, ?)" predictionsToInsert
     let passageInfo :: [PassageInfo] = Vector.toList tripPassages &
           fmap (\Passage{..} -> PassageInfo{..})
-        maxBy :: (a -> a -> Ordering) -> a -> a -> a
-        maxBy f x y = case f x y of
-          LT -> y
-          _ -> x
     mostRecentPassageInfo <- fmap (Map.fromListWith (maxBy (comparing (^. _1)))
                                    . fmap (\(a, b, c, d, e, f) -> (a, (b, c, d, e, f))))
                              (SQLite.query_ connection
@@ -510,6 +533,11 @@ collectData manager connection = do
              (Map.lookup (pi ^. field @"id") mostRecentPassageInfo)
            )
         (SQLite.execute connection "insert into passages values (?, ?, ?, ?, ?, ?)" pi) -- should be an upsert?
+
+maxBy :: (a -> a -> Ordering) -> a -> a -> a
+maxBy f x y = case f x y of
+  LT -> y
+  _ -> x
 
 dataCollectorApp :: TVar DataCollectorState -> Application
 dataCollectorApp =
@@ -623,7 +651,9 @@ newtype TripId = TripId Text
     deriving (Eq, Show, Generic)
     deriving newtype (FromJSON, SQLite.FromField)
 
-newtype MillisTimestamp = MillisTimestamp UTCTime deriving (Show, Eq)
+newtype MillisTimestamp = MillisTimestamp UTCTime
+  deriving (Show, Eq)
+  deriving newtype (SQLite.FromField)
 
 instance FromJSON MillisTimestamp where
   parseJSON = withScientific "MillisTimestamp" $
@@ -635,7 +665,9 @@ instance FromJSON MillisTimestamp where
         pure (MillisTimestamp (posixSecondsToUTCTime
           (secondsToNominalDiffTime (MkFixed (1000000000 * i)))))
 
-newtype SecondsTimestamp = SecondsTimestamp {unSecondsTimestamp :: UTCTime} deriving (Show, Eq, Ord)
+newtype SecondsTimestamp = SecondsTimestamp {unSecondsTimestamp :: UTCTime}
+  deriving (Show, Eq, Ord)
+  deriving newtype (SQLite.FromField)
 
 instance FromJSON SecondsTimestamp where
   parseJSON = withScientific "SecondsTimestamp" $
