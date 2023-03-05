@@ -25,21 +25,22 @@ module Lib
 import Control.Applicative (liftA2)
 import Control.Concurrent.Async (mapConcurrently)
 import Control.Exception (catch, throw)
-import Control.Lens ((^.))
-import Control.Monad (join)
+import Control.Lens ((^.), to, _1)
+import Control.Monad (join, when, unless)
 import Data.Aeson as Aeson
 import Data.Aeson.Types (Parser)
 import qualified Data.ByteString.Lazy as LazyByteString
 import Data.Coerce (coerce)
 import Data.Either (fromRight)
 import Data.Fixed (Fixed(..))
-import Data.Foldable (traverse_)
-import Data.Function ((&))
+import Data.Foldable (traverse_, for_)
+import Data.Function ((&), on)
 import Data.Functor (void)
 import Data.Generics.Product (field)
 import Data.List (intersperse, sortOn)
 import Data.Maybe (catMaybes, isJust, mapMaybe)
 import Data.Map.Strict (Map)
+import Data.Ord (comparing)
 import Data.Proxy
 import Data.Set (Set)
 import qualified Data.Set as Set
@@ -49,7 +50,7 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Lazy as LazyText
 import Data.Text.Lazy.Encoding (encodeUtf8, decodeUtf8)
-import Data.Time.Clock (UTCTime, secondsToNominalDiffTime, getCurrentTime)
+import Data.Time.Clock (UTCTime, secondsToNominalDiffTime, getCurrentTime, addUTCTime, nominalDay)
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Data.Vector (Vector)
 import qualified Data.Vector as Vector
@@ -57,9 +58,10 @@ import qualified Data.Map.Strict as Map
 import qualified Database.SQLite.Simple as SQLite
 import Database.SQLite.Simple (SQLData(..))
 import qualified Database.SQLite.Simple.ToField as SQLite
+import qualified Database.SQLite.Simple.FromField as SQLite
 import GHC.Generics (Generic)
 import qualified Lucid
-import Lucid hiding (type_)
+import Lucid hiding (type_, for_)
 import Network.HTTP.Client (newManager, Manager, managerModifyRequest, responseTimeout, responseTimeoutMicro)
 import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Network.Wai (Application)
@@ -77,17 +79,21 @@ import qualified Database
 
 callStopPassage :: IO ()
 callStopPassage = do
-  StopPassageResponse passages <- getStopPassages Nothing churchCrossEast
+  StopPassageResponse passages <- getStopPassages Nothing (Left churchCrossEast)
   traverse_ (print . departure) passages
 
-getStopPassages :: Maybe Manager -> StopId -> IO StopPassageResponse
-getStopPassages Nothing stopId = do
+getStopPassages :: Maybe Manager -> Either StopId TripId -> IO StopPassageResponse
+getStopPassages Nothing stopOrTripId = do
   manager <- newManager tlsManagerSettings
-  result <- runClientM (stopPassage (Just stopId) Nothing)
-                                    (mkClientEnv manager (BaseUrl Https "buseireann.ie" 443 ""))
+  result <- runClientM (stopPassage
+                        (either Just (const Nothing) stopOrTripId)
+                        (either (const Nothing) Just stopOrTripId))
+                        (mkClientEnv manager (BaseUrl Https "buseireann.ie" 443 ""))
   pure (either (error . ("Failed to get bus stop passages: " <>) . show) Prelude.id result)
-getStopPassages (Just manager) stopId = do
-  result <- runClientM (stopPassage (Just stopId) Nothing)
+getStopPassages (Just manager) stopOrTripId = do
+  result <- runClientM (stopPassage
+                        (either Just (const Nothing) stopOrTripId)
+                        (either (const Nothing) Just stopOrTripId))
                                     (mkClientEnv manager (BaseUrl Https "buseireann.ie" 443 ""))
   pure (either (error . ("Failed to get bus stop passages: " <>) . show) Prelude.id result)
 
@@ -131,7 +137,7 @@ getRouteStopMap = do
     getRoutes :: BusStop -> IO (Vector RouteId)
     getRoutes stop = do
       let stopId = stop ^. field @"id"
-      StopPassageResponse passages <- getStopPassages (Just manager) stopId
+      StopPassageResponse passages <- getStopPassages (Just manager) (Left stopId)
       return (fmap (^. field @"routeId") passages)
     getBatchRoutes :: Integer -> Vector BusStop -> IO (Vector BusStop, Vector (Vector RouteId))
     getBatchRoutes n stops = do
@@ -165,7 +171,7 @@ writeRouteStopMaps outputFile = do
     writeRoutes :: BusStop -> IO ()
     writeRoutes stop = do
       let stopId@(StopId s) = stop ^. field @"id"
-      StopPassageResponse passages <- getStopPassages (Just manager) stopId
+      StopPassageResponse passages <- getStopPassages (Just manager) (Left stopId)
       let routes = fmap (^. field @"routeId") passages
       let object = Map.fromList [("routes" :: Text, toJSON routes), ("stop", toJSON stop)]
       encodeFile ("data/routeMap/" <> Text.unpack s <> ".json") object
@@ -388,7 +394,7 @@ data VehicleInfo = VehicleInfo
   , vehicleId :: VehicleId
   , isAccessible :: Maybe Bool
   , hasBikeRack :: Maybe Bool
-  }
+  } deriving (Show, Eq, Generic, Ord)
 
 instance SQLite.ToRow VehicleInfo where
   toRow VehicleInfo{..} =
@@ -398,6 +404,13 @@ instance SQLite.ToRow VehicleInfo where
     , SQLite.toField hasBikeRack
     ]
 
+instance SQLite.FromRow VehicleInfo where
+  fromRow = VehicleInfo
+    <$> SQLite.field
+    <*> fmap (coerce :: Text -> VehicleId) SQLite.field
+    <*> SQLite.field
+    <*> SQLite.field
+
 -- | Recorded when it changes.
 data PassageInfo = PassageInfo
   { id :: PassageId
@@ -406,7 +419,7 @@ data PassageInfo = PassageInfo
   , routeId :: RouteId
   , stopId :: StopId
   , vehicleId :: Maybe VehicleId
-  }
+  } deriving (Generic)
 
 instance SQLite.ToRow PassageInfo where
   toRow PassageInfo{..} =
@@ -423,24 +436,17 @@ collectData manager connection = do
   -- for each stop on the 220 route:
   -- - poll the stopPassage endpoint
   -- - save retrieved info into the state variable
-  StopPassageResponse passages <- liftIO (getStopPassages (Just manager) churchCrossEast)
+  --
+  -- v2:
+  -- call church cross east, get a list of trip ids
+  -- for each of those trips:
+  --   call stopPassage
+  --   store the retrieved info for each stop in the response
+  StopPassageResponse passages <- liftIO (getStopPassages (Just manager) (Left churchCrossEast))
   now <- getCurrentTime
   let retrievedAt = now
-  let predictions :: [Prediction] = Vector.toList passages &
-        mapMaybe (\Passage{..} -> do
-                     let passageId = id
-                     (scheduledArrivalTime, actualOrEstimatedArrivalTime) <- do
-                       td <- arrival
-                       return (td ^. field @"scheduledPassageTime", td ^. field @"actualPassageTime")
-                     (scheduledDepartureTime, actualOrEstimatedDepartureTime) <- do
-                       td <- departure
-                       return (td ^. field @"scheduledPassageTime", td ^. field @"actualPassageTime")
-                     return Prediction{..})
-  let locations :: [Location] = Vector.toList passages &
-        mapMaybe (\Passage{..} -> do
-                     vehicleId' <- vehicleId
-                     return Location{vehicleId = vehicleId', ..})
-  let vehicleInfo :: [VehicleInfo] = Vector.toList passages &
+  let tripIds = fmap (^. field @"tripId") passages
+  let vehicleInfo :: Set VehicleInfo = Vector.toList passages &
         mapMaybe (\Passage{..} -> do
                      vehicleId' <- vehicleId
                      return VehicleInfo
@@ -449,12 +455,61 @@ collectData manager connection = do
                        , hasBikeRack = coerce hasBikeRack
                        , retrievedAt
                        })
-  let passageInfo :: [PassageInfo] = Vector.toList passages &
-        fmap (\Passage{..} -> PassageInfo{..})
-  SQLite.executeMany connection "insert into predictions values (?, ?, ?, ?, ?, ?, ?, ?)" predictions
+        & Set.fromList
+  oldVehicleInfo <- fmap Set.fromList (SQLite.query_ connection
+    "select vehicleId, isAccessible, hasBikeRack \
+    \ from vehicles \
+    \ order by retrievedAt desc "
+    :: IO [(Text, Maybe Bool, Maybe Bool)])
+  for_ vehicleInfo \vi -> do
+    unless (( vi ^. field @"vehicleId" . to coerce
+          , vi ^. field @"isAccessible"
+          , vi ^. field @"hasBikeRack"
+          ) `Set.member` oldVehicleInfo)
+      (SQLite.execute connection "insert into vehicles values (?, ?, ?, ?)" vi)
+  let locations :: [Location] = Vector.toList passages &
+        mapMaybe (\Passage{..} -> do
+                     vehicleId' <- vehicleId
+                     return Location{vehicleId = vehicleId', ..})
   SQLite.executeMany connection "insert into locations values (?, ?, ?, ?, ?, ?, ?, ?)" locations
-  SQLite.executeMany connection "insert into vehicles values (?, ?, ?, ?)" vehicleInfo -- should be an upsert?
-  SQLite.executeMany connection "insert into passages values (?, ?, ?, ?, ?, ?)" passageInfo -- should be an upsert?
+  for_ tripIds \trip -> do
+    StopPassageResponse tripPassages <- liftIO (getStopPassages (Just manager) (Right trip))
+    now <- getCurrentTime
+    let retrievedAt = now
+    let predictions :: [Prediction] = Vector.toList tripPassages &
+          mapMaybe (\Passage{..} -> do
+                       let passageId = id
+                       (scheduledArrivalTime, actualOrEstimatedArrivalTime) <- do
+                         td <- arrival
+                         return (td ^. field @"scheduledPassageTime", td ^. field @"actualPassageTime")
+                       (scheduledDepartureTime, actualOrEstimatedDepartureTime) <- do
+                         td <- departure
+                         return (td ^. field @"scheduledPassageTime", td ^. field @"actualPassageTime")
+                       return Prediction{..})
+    SQLite.executeMany connection "insert into predictions values (?, ?, ?, ?, ?, ?, ?, ?)" predictions
+    let passageInfo :: [PassageInfo] = Vector.toList tripPassages &
+          fmap (\Passage{..} -> PassageInfo{..})
+        maxBy :: (a -> a -> Ordering) -> a -> a -> a
+        maxBy f x y = case f x y of
+          LT -> y
+          _ -> x
+    mostRecentPassageInfo <- fmap (Map.fromListWith (maxBy (comparing (^. _1)))
+                                   . fmap (\(a, b, c, d, e, f) -> (a, (b, c, d, e, f))))
+                             (SQLite.query_ connection
+      -- need rest of row though
+      " select * \
+      \ from passages \
+      \ " :: IO [(PassageId, UTCTime, TripId, RouteId, StopId, Maybe VehicleId)])
+    for_ passageInfo \pi -> do
+      when (maybe True
+             (\(t, tId, rId, sId, vId) ->
+                (tId, rId, sId, vId)
+                  /= (pi ^. field @"tripId", pi ^. field @"routeId"
+                     , pi ^. field @"stopId", pi ^. field @"vehicleId")
+                || (t < addUTCTime (negate nominalDay) (pi ^. field @"retrievedAt")))
+             (Map.lookup (pi ^. field @"id") mostRecentPassageInfo)
+           )
+        (SQLite.execute connection "insert into passages values (?, ?, ?, ?, ?, ?)" pi) -- should be an upsert?
 
 dataCollectorApp :: TVar DataCollectorState -> Application
 dataCollectorApp =
@@ -492,7 +547,7 @@ runBusboyApp databasePath = do
 
 queryBusEireann :: ServerState -> IO ()
 queryBusEireann ServerState{ stopData } = do
-  StopPassageResponse passages <- liftIO (getStopPassages Nothing churchCrossEast)
+  StopPassageResponse passages <- liftIO (getStopPassages Nothing (Left churchCrossEast))
   now <- getCurrentTime
   (liftIO . atomically) do
     stopDataMap <- readTVar stopData
@@ -544,19 +599,16 @@ instance Accept StrippedJavaScript where
 
 newtype StopId = StopId Text
   deriving (Eq, Show, Ord)
-  deriving newtype FromJSON
-  deriving newtype ToJSON
+  deriving newtype (FromJSON, ToJSON, SQLite.FromField)
 newtype PassageId = PassageId Text
   deriving (Eq, Show, Ord)
-  deriving newtype FromJSON
+  deriving newtype (FromJSON, SQLite.FromField)
 newtype RouteId = RouteId Text
   deriving (Eq, Show, Ord)
-  deriving newtype FromJSON
-  deriving newtype ToJSON
-  deriving newtype ToJSONKey
+  deriving newtype (FromJSON, ToJSON, ToJSONKey, SQLite.FromField)
 newtype VehicleId = VehicleId {unVehicleId :: Text}
-  deriving (Eq, Show)
-  deriving newtype FromJSON
+  deriving (Eq, Show, Ord)
+  deriving newtype (FromJSON, SQLite.FromField)
 newtype PatternId = PatternId Text
   deriving (Eq, Show)
   deriving newtype FromJSON
@@ -569,7 +621,7 @@ instance FromJSON a => FromJSON (Duid a) where
 
 newtype TripId = TripId Text
     deriving (Eq, Show, Generic)
-    deriving newtype FromJSON
+    deriving newtype (FromJSON, SQLite.FromField)
 
 newtype MillisTimestamp = MillisTimestamp UTCTime deriving (Show, Eq)
 
