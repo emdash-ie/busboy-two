@@ -24,9 +24,10 @@ module Lib
     ) where
 
 import Control.Applicative (liftA2)
+import Control.Category ((>>>))
 import Control.Concurrent.Async (mapConcurrently)
-import Control.Exception (catch, throw)
-import Control.Lens ((^.), to, _1)
+import Control.Exception hiding (Handler)
+import Control.Lens ((^.), to, _1, views, (^..))
 import Control.Monad (join, when, unless, guard)
 import Data.Aeson as Aeson
 import Data.Aeson.Types (Parser)
@@ -38,6 +39,7 @@ import Data.Foldable (traverse_, for_)
 import Data.Function ((&), on)
 import Data.Functor (void)
 import Data.Generics.Product (field)
+import Data.Generics.Sum (_Ctor)
 import Data.List (intersperse, sortOn)
 import Data.Maybe (catMaybes, isJust, mapMaybe)
 import Data.Map.Strict (Map)
@@ -54,6 +56,7 @@ import Data.Text.Lazy.Encoding (encodeUtf8, decodeUtf8)
 import Data.Time.Clock (UTCTime, secondsToNominalDiffTime, getCurrentTime, addUTCTime, nominalDay)
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Data.Vector (Vector)
+import Data.Vector.Lens (toVectorOf)
 import qualified Data.Vector as Vector
 import qualified Data.Map.Strict as Map
 import qualified Database.SQLite.Simple as SQLite
@@ -63,7 +66,7 @@ import qualified Database.SQLite.Simple.FromField as SQLite
 import GHC.Generics (Generic)
 import qualified Lucid
 import Lucid hiding (type_, for_)
-import Network.HTTP.Client (newManager, Manager, managerModifyRequest, responseTimeout, responseTimeoutMicro)
+import Network.HTTP.Client hiding (Proxy)
 import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Network.Wai (Application)
 import Network.Wai.Handler.Warp (run)
@@ -80,43 +83,51 @@ import qualified Database
 
 callStopPassage :: IO ()
 callStopPassage = do
-  StopPassageResponse passages <- getStopPassages Nothing (Left churchCrossEast)
-  traverse_ (print . departure) passages
+  response <- getStopPassages Nothing (Left churchCrossEast)
+  case response of
+    Just (StopPassageResponse passages) -> do
+      traverse_ (print . departure) passages
+    _ -> putStrLn "Timeout while calling stopPassage"
 
-getStopPassages :: Maybe Manager -> Either StopId TripId -> IO StopPassageResponse
-getStopPassages Nothing stopOrTripId = do
+getStopPassages :: Maybe Manager -> Either StopId TripId -> IO (Maybe StopPassageResponse)
+getStopPassages Nothing stopOrTripId = ignoringTimeouts do
   manager <- newManager tlsManagerSettings
   result <- runClientM (stopPassage
                         (either Just (const Nothing) stopOrTripId)
                         (either (const Nothing) Just stopOrTripId))
                         (mkClientEnv manager (BaseUrl Https "buseireann.ie" 443 ""))
   pure (either (error . ("Failed to get bus stop passages: " <>) . show) Prelude.id result)
-getStopPassages (Just manager) stopOrTripId = do
+getStopPassages (Just manager) stopOrTripId = ignoringTimeouts do
   result <- runClientM (stopPassage
                         (either Just (const Nothing) stopOrTripId)
                         (either (const Nothing) Just stopOrTripId))
                                     (mkClientEnv manager (BaseUrl Https "buseireann.ie" 443 ""))
   pure (either (error . ("Failed to get bus stop passages: " <>) . show) Prelude.id result)
 
+ignoringTimeouts :: IO a -> IO (Maybe a)
+ignoringTimeouts = fmap Just >>> handle \case
+  e@(HttpExceptionRequest _ ResponseTimeout) -> return Nothing
+  e -> throw e
+
 callStopPoints :: IO ()
 callStopPoints = do
-  BusStopPoints stops <- getStopPoints Nothing
+  Just (BusStopPoints stops) <- getStopPoints Nothing
   putStrLn ("Got " <> show (Vector.length stops) <> " stops.")
   putStrLn ("The first is: " <> show (stops Vector.! 0))
 
-getStopPoints :: Maybe Manager -> IO BusStopPoints
-getStopPoints Nothing = do
+getStopPoints :: Maybe Manager -> IO (Maybe BusStopPoints)
+getStopPoints Nothing = ignoringTimeouts do
   manager <- newManager tlsManagerSettings
   result <- runClientM stopPoints (mkClientEnv manager (BaseUrl Https "buseireann.ie" 443 ""))
   pure (either (error . ("Failed to get bus stop points: " <>) . show) Prelude.id result)
-getStopPoints (Just manager) = do
+getStopPoints (Just manager) = ignoringTimeouts do
   manager <- newManager tlsManagerSettings
   result <- runClientM stopPoints (mkClientEnv manager (BaseUrl Https "buseireann.ie" 443 ""))
   pure (either (error . ("Failed to get bus stop points: " <>) . show) Prelude.id result)
 
 makeStopPointsHtml :: IO ()
 makeStopPointsHtml = do
-  BusStopPoints stops <- getStopPoints Nothing
+  Just (BusStopPoints stops) <- getStopPoints Nothing
   let makeOption :: BusStop -> Html ()
       makeOption stop = option_ [value_ (name stop <> " [" <> Text.pack (show (stop ^. field @"number")) <> "]")] (pure ())
   let html = main_ $ body_ $ do
@@ -124,76 +135,83 @@ makeStopPointsHtml = do
         datalist_ [id_ "stops"] (select_ (foldMap makeOption stops))
   Lucid.renderToFile "Stops.html" html
 
-getRoutes :: IO Routes
-getRoutes = do
+getRoutes :: IO (Maybe Routes)
+getRoutes = ignoringTimeouts do
   manager <- newManager tlsManagerSettings
   result <- runClientM routesEndpoint (mkClientEnv manager (BaseUrl Https "buseireann.ie" 443 ""))
   pure (either (error . ("Failed to get routes: " <>) . show) Prelude.id result)
 
-getRouteStopMap :: IO (Map RouteId (Set BusStop))
-getRouteStopMap = do
+getRouteStopMap :: IO (Maybe (Map RouteId (Set BusStop)))
+getRouteStopMap = ignoringTimeouts do
   manager <- newManager tlsManagerSettings
-  BusStopPoints stops <- getStopPoints (Just manager)
-  let
-    getRoutes :: BusStop -> IO (Vector RouteId)
-    getRoutes stop = do
-      let stopId = stop ^. field @"id"
-      StopPassageResponse passages <- getStopPassages (Just manager) (Left stopId)
-      return (fmap (^. field @"routeId") passages)
-    getBatchRoutes :: Integer -> Vector BusStop -> IO (Vector BusStop, Vector (Vector RouteId))
-    getBatchRoutes n stops = do
-      putStrLn ("Starting batch " <> show n)
-      let (batch, rest) = Vector.splitAt 10 stops
-      batchRoutes :: Vector (Vector RouteId) <- mapConcurrently getRoutes batch
-      putStrLn ("Finished batch " <> show n)
-      putStrLn "Waiting…"
-      threadDelay 1000000 -- 1 second
-      return (rest, batchRoutes)
-    getBatches :: Integer -> Vector BusStop -> IO (Vector (Vector RouteId))
-    getBatches n stops = do
-      (rest, routes) <- getBatchRoutes n stops
-      if Vector.null rest
-      then return routes
-      else return routes <> getBatches (n + 1) rest
-    -- getRoutesSync :: Vector BusStop -> IO (Vector (Vector RouteId))
-    -- getRoutesSync =
-  routes <- getBatches 1 stops
-  let
-    pairs :: Vector (RouteId, Set BusStop)
-    pairs = fmap (\(x, y) -> (y, Set.singleton x))
-      (join (Vector.zipWith (\s rs -> fmap (s ,) rs) stops routes))
-  return (Map.fromListWith Set.union (Vector.toList pairs))
+  stopsResponse <- getStopPoints (Just manager)
+  case stopsResponse of
+    Nothing -> return Map.empty
+    Just (BusStopPoints stops) -> do
+      let
+        getRoutes :: BusStop -> IO (Vector RouteId)
+        getRoutes stop = do
+          let stopId = stop ^. field @"id"
+          response <- getStopPassages (Just manager) (Left stopId)
+          let f :: StopPassageResponse -> Vector RouteId
+              f = toVectorOf (field @"stopPassageTdi" . traverse . field @"routeId")
+          return (maybe Vector.empty f response)
+        getBatchRoutes :: Integer -> Vector BusStop -> IO (Vector BusStop, Vector (Vector RouteId))
+        getBatchRoutes n stops = do
+          putStrLn ("Starting batch " <> show n)
+          let (batch, rest) = Vector.splitAt 10 stops
+          batchRoutes :: Vector (Vector RouteId) <- mapConcurrently getRoutes batch
+          putStrLn ("Finished batch " <> show n)
+          putStrLn "Waiting…"
+          threadDelay 1000000 -- 1 second
+          return (rest, batchRoutes)
+        getBatches :: Integer -> Vector BusStop -> IO (Vector (Vector RouteId))
+        getBatches n stops = do
+          (rest, routes) <- getBatchRoutes n stops
+          if Vector.null rest
+          then return routes
+          else return routes <> getBatches (n + 1) rest
+      routes <- getBatches 1 stops
+      let
+        pairs :: Vector (RouteId, Set BusStop)
+        pairs = fmap (\(x, y) -> (y, Set.singleton x))
+          (join (Vector.zipWith (\s rs -> fmap (s ,) rs) stops routes))
+      return (Map.fromListWith Set.union (Vector.toList pairs))
 
 writeRouteStopMaps :: FilePath -> IO ()
 writeRouteStopMaps outputFile = do
   manager <- newManager tlsManagerSettings
-  BusStopPoints stops <- getStopPoints (Just manager)
-  let
-    writeRoutes :: BusStop -> IO ()
-    writeRoutes stop = do
-      let stopId@(StopId s) = stop ^. field @"id"
-      StopPassageResponse passages <- getStopPassages (Just manager) (Left stopId)
-      let routes = fmap (^. field @"routeId") passages
-      let object = Map.fromList [("routes" :: Text, toJSON routes), ("stop", toJSON stop)]
-      encodeFile ("data/routeMap/" <> Text.unpack s <> ".json") object
-    writeBatchRoutes :: Integer -> Vector BusStop -> IO (Vector BusStop)
-    writeBatchRoutes n stops = do
-      putStrLn ("Starting batch " <> show n)
-      let (batch, rest) = Vector.splitAt 10 stops
-      mapConcurrently writeRoutes batch
-      putStrLn ("Finished batch " <> show n)
-      putStrLn "Waiting…"
-      threadDelay 1000000 -- 1 second
-      return rest
-    writeBatches :: Integer -> Vector BusStop -> IO ()
-    writeBatches n stops = do
-      rest <- writeBatchRoutes n stops
-      if Vector.null rest
-      then return ()
-      else writeBatches (n + 1) rest
-    -- getRoutesSync :: Vector BusStop -> IO (Vector (Vector RouteId))
-    -- getRoutesSync =
-  writeBatches 1 stops
+  stopsResponse <- getStopPoints (Just manager)
+  case stopsResponse of
+    Just (BusStopPoints stops) -> do
+      let
+        writeRoutes :: BusStop -> IO ()
+        writeRoutes stop = do
+          let stopId@(StopId s) = stop ^. field @"id"
+          passageResponse <- getStopPassages (Just manager) (Left stopId)
+          case passageResponse of
+            Just (StopPassageResponse passages) -> let
+              routes = fmap (^. field @"routeId") passages
+              object = Map.fromList [("routes" :: Text, toJSON routes), ("stop", toJSON stop)]
+              in encodeFile ("data/routeMap/" <> Text.unpack s <> ".json") object
+            Nothing -> putStrLn "Timed out getting passages!"
+        writeBatchRoutes :: Integer -> Vector BusStop -> IO (Vector BusStop)
+        writeBatchRoutes n stops = do
+          putStrLn ("Starting batch " <> show n)
+          let (batch, rest) = Vector.splitAt 10 stops
+          mapConcurrently writeRoutes batch
+          putStrLn ("Finished batch " <> show n)
+          putStrLn "Waiting…"
+          threadDelay 1000000 -- 1 second
+          return rest
+        writeBatches :: Integer -> Vector BusStop -> IO ()
+        writeBatches n stops = do
+          rest <- writeBatchRoutes n stops
+          if Vector.null rest
+          then return ()
+          else writeBatches (n + 1) rest
+      writeBatches 1 stops
+    Nothing -> putStrLn "Timed out getting stops!"
 
 churchCrossEast :: StopId
 churchCrossEast = StopId "7338653551721429731"
@@ -453,86 +471,92 @@ collectData manager connection = do
   -- for each of those trips:
   --   call stopPassage
   --   store the retrieved info for each stop in the response
-  StopPassageResponse passages <- liftIO (getStopPassages (Just manager) (Left churchCrossEast))
-  now <- getCurrentTime
-  let retrievedAt = now
-  let tripIds = fmap (^. field @"tripId") passages
-  let vehicleInfo :: Set VehicleInfo = Vector.toList passages &
-        mapMaybe (\Passage{..} -> do
-                     vehicleId' <- vehicleId
-                     return VehicleInfo
-                       { vehicleId = vehicleId'
-                       , isAccessible = coerce isAccessible
-                       , hasBikeRack = coerce hasBikeRack
-                       , retrievedAt
-                       })
-        & Set.fromList
-  oldVehicleInfo <- fmap Set.fromList (SQLite.query_ connection
-    "select vehicleId, isAccessible, hasBikeRack \
-    \ from vehicles \
-    \ order by retrievedAt desc "
-    :: IO [(Text, Maybe Bool, Maybe Bool)])
-  for_ vehicleInfo \vi -> do
-    unless (( vi ^. field @"vehicleId" . to coerce
-          , vi ^. field @"isAccessible"
-          , vi ^. field @"hasBikeRack"
-          ) `Set.member` oldVehicleInfo)
-      (SQLite.execute connection "insert into vehicles values (?, ?, ?, ?)" vi)
-  let locations :: [Location] = Vector.toList passages &
-        mapMaybe (\Passage{..} -> do
-                     vehicleId' <- vehicleId
-                     return Location{vehicleId = vehicleId', ..})
-  SQLite.executeMany connection "insert into locations values (?, ?, ?, ?, ?, ?, ?, ?)" locations
-  for_ tripIds \trip -> do
-    StopPassageResponse tripPassages <- liftIO (getStopPassages (Just manager) (Right trip))
-    now <- getCurrentTime
-    let retrievedAt = now
-    mostRecentPredictions :: Map (PassageId, StopId) Prediction <- fmap (Map.fromListWith (maxBy (comparing (^. field @"retrievedAt")))
-                                  . fmap (\p@Prediction{passageId, stopId} -> ((passageId, stopId), p)))
-                             (SQLite.query_ connection
-                             "select * from predictions" :: IO [Prediction])
-    let predictionsToInsert :: [Prediction] = Vector.toList tripPassages &
-          mapMaybe (\p@Passage{..} -> do
-            let passageId = id
-            (scheduledArrivalTime, actualOrEstimatedArrivalTime) <- do
-              td <- arrival
-              return (td ^. field @"scheduledPassageTime", td ^. field @"actualPassageTime")
-            (scheduledDepartureTime, actualOrEstimatedDepartureTime) <- do
-              td <- departure
-              return (td ^. field @"scheduledPassageTime", td ^. field @"actualPassageTime")
-            let prediction = Prediction{..}
-            let passageSubfields p =
-                  ( p ^. field @"lastModified"
-                   , p ^. field @"scheduledArrivalTime"
-                   , p ^. field @"actualOrEstimatedArrivalTime"
-                   , p ^. field @"scheduledDepartureTime"
-                   , p ^. field @"actualOrEstimatedDepartureTime"
+  churchCrossEastResponse <- liftIO (getStopPassages (Just manager) (Left churchCrossEast))
+  case churchCrossEastResponse of
+    Nothing -> putStrLn "Timed out querying church cross east: waiting for next step"
+    Just (StopPassageResponse passages) -> do
+      now <- getCurrentTime
+      let retrievedAt = now
+      let tripIds = fmap (^. field @"tripId") passages
+      let vehicleInfo :: Set VehicleInfo = Vector.toList passages &
+            mapMaybe (\Passage{..} -> do
+                         vehicleId' <- vehicleId
+                         return VehicleInfo
+                           { vehicleId = vehicleId'
+                           , isAccessible = coerce isAccessible
+                           , hasBikeRack = coerce hasBikeRack
+                           , retrievedAt
+                           })
+            & Set.fromList
+      oldVehicleInfo <- fmap Set.fromList (SQLite.query_ connection
+        "select vehicleId, isAccessible, hasBikeRack \
+        \ from vehicles \
+        \ order by retrievedAt desc "
+        :: IO [(Text, Maybe Bool, Maybe Bool)])
+      for_ vehicleInfo \vi -> do
+        unless (( vi ^. field @"vehicleId" . to coerce
+              , vi ^. field @"isAccessible"
+              , vi ^. field @"hasBikeRack"
+              ) `Set.member` oldVehicleInfo)
+          (SQLite.execute connection "insert into vehicles values (?, ?, ?, ?)" vi)
+      let locations :: [Location] = Vector.toList passages &
+            mapMaybe (\Passage{..} -> do
+                         vehicleId' <- vehicleId
+                         return Location{vehicleId = vehicleId', ..})
+      SQLite.executeMany connection "insert into locations values (?, ?, ?, ?, ?, ?, ?, ?)" locations
+      for_ tripIds \trip -> do
+        tripResponse <- liftIO (getStopPassages (Just manager) (Right trip))
+        case tripResponse of
+          Nothing -> liftIO (putStrLn ("Time out on trip " <> Text.unpack (unTripId trip) <> ": skipping"))
+          Just (StopPassageResponse tripPassages) -> do
+            now <- getCurrentTime
+            let retrievedAt = now
+            mostRecentPredictions :: Map (PassageId, StopId) Prediction <- fmap (Map.fromListWith (maxBy (comparing (^. field @"retrievedAt")))
+                                          . fmap (\p@Prediction{passageId, stopId} -> ((passageId, stopId), p)))
+                                     (SQLite.query_ connection
+                                     "select * from predictions" :: IO [Prediction])
+            let predictionsToInsert :: [Prediction] = Vector.toList tripPassages &
+                  mapMaybe (\p@Passage{..} -> do
+                    let passageId = id
+                    (scheduledArrivalTime, actualOrEstimatedArrivalTime) <- do
+                      td <- arrival
+                      return (td ^. field @"scheduledPassageTime", td ^. field @"actualPassageTime")
+                    (scheduledDepartureTime, actualOrEstimatedDepartureTime) <- do
+                      td <- departure
+                      return (td ^. field @"scheduledPassageTime", td ^. field @"actualPassageTime")
+                    let prediction = Prediction{..}
+                    let passageSubfields p =
+                          ( p ^. field @"lastModified"
+                           , p ^. field @"scheduledArrivalTime"
+                           , p ^. field @"actualOrEstimatedArrivalTime"
+                           , p ^. field @"scheduledDepartureTime"
+                           , p ^. field @"actualOrEstimatedDepartureTime"
+                           )
+                    guard (maybe
+                          True
+                           ((passageSubfields prediction /=) . passageSubfields)
+                           (Map.lookup (passageId, stopId) mostRecentPredictions))
+                    return Prediction{..})
+            SQLite.executeMany connection "insert into predictions values (?, ?, ?, ?, ?, ?, ?, ?)" predictionsToInsert
+            let passageInfo :: [PassageInfo] = Vector.toList tripPassages &
+                  fmap (\Passage{..} -> PassageInfo{..})
+            mostRecentPassageInfo <- fmap (Map.fromListWith (maxBy (comparing (^. _1)))
+                                           . fmap (\(a, b, c, d, e, f) -> (a, (b, c, d, e, f))))
+                                     (SQLite.query_ connection
+              -- need rest of row though
+              " select * \
+              \ from passages \
+              \ " :: IO [(PassageId, UTCTime, TripId, RouteId, StopId, Maybe VehicleId)])
+            for_ passageInfo \pi -> do
+              when (maybe True
+                     (\(t, tId, rId, sId, vId) ->
+                        (tId, rId, sId, vId)
+                          /= (pi ^. field @"tripId", pi ^. field @"routeId"
+                             , pi ^. field @"stopId", pi ^. field @"vehicleId")
+                        || (t < addUTCTime (negate nominalDay) (pi ^. field @"retrievedAt")))
+                     (Map.lookup (pi ^. field @"id") mostRecentPassageInfo)
                    )
-            guard (maybe
-                  True
-                   ((passageSubfields prediction /=) . passageSubfields)
-                   (Map.lookup (passageId, stopId) mostRecentPredictions))
-            return Prediction{..})
-    SQLite.executeMany connection "insert into predictions values (?, ?, ?, ?, ?, ?, ?, ?)" predictionsToInsert
-    let passageInfo :: [PassageInfo] = Vector.toList tripPassages &
-          fmap (\Passage{..} -> PassageInfo{..})
-    mostRecentPassageInfo <- fmap (Map.fromListWith (maxBy (comparing (^. _1)))
-                                   . fmap (\(a, b, c, d, e, f) -> (a, (b, c, d, e, f))))
-                             (SQLite.query_ connection
-      -- need rest of row though
-      " select * \
-      \ from passages \
-      \ " :: IO [(PassageId, UTCTime, TripId, RouteId, StopId, Maybe VehicleId)])
-    for_ passageInfo \pi -> do
-      when (maybe True
-             (\(t, tId, rId, sId, vId) ->
-                (tId, rId, sId, vId)
-                  /= (pi ^. field @"tripId", pi ^. field @"routeId"
-                     , pi ^. field @"stopId", pi ^. field @"vehicleId")
-                || (t < addUTCTime (negate nominalDay) (pi ^. field @"retrievedAt")))
-             (Map.lookup (pi ^. field @"id") mostRecentPassageInfo)
-           )
-        (SQLite.execute connection "insert into passages values (?, ?, ?, ?, ?, ?)" pi) -- should be an upsert?
+                (SQLite.execute connection "insert into passages values (?, ?, ?, ?, ?, ?)" pi) -- should be an upsert?
 
 maxBy :: (a -> a -> Ordering) -> a -> a -> a
 maxBy f x y = case f x y of
@@ -545,8 +569,8 @@ dataCollectorApp =
   -- maybe an endpoint for saving to a csv?
   undefined
 
-getStopsForRoute :: RouteId -> IO (Set StopId)
-getStopsForRoute route = do
+getStopsForRoute :: RouteId -> IO (Maybe (Set StopId))
+getStopsForRoute route = ignoringTimeouts do
   stopPoints <- getStopPoints Nothing
   let routeForStop = undefined
   undefined
@@ -575,7 +599,7 @@ runBusboyApp databasePath = do
 
 queryBusEireann :: ServerState -> IO ()
 queryBusEireann ServerState{ stopData } = do
-  StopPassageResponse passages <- liftIO (getStopPassages Nothing (Left churchCrossEast))
+  Just (StopPassageResponse passages) <- liftIO (getStopPassages Nothing (Left churchCrossEast))
   now <- getCurrentTime
   (liftIO . atomically) do
     stopDataMap <- readTVar stopData
@@ -647,7 +671,7 @@ instance FromJSON a => FromJSON (Duid a) where
     a <- o .: "duid"
     pure (Duid a)
 
-newtype TripId = TripId Text
+newtype TripId = TripId { unTripId :: Text }
     deriving (Eq, Show, Generic)
     deriving newtype (FromJSON, SQLite.FromField)
 
@@ -698,7 +722,7 @@ instance FromHttpApiData TripId where
 
 newtype StopPassageResponse = StopPassageResponse
   { stopPassageTdi :: Vector Passage
-  } deriving Show
+  } deriving (Show, Generic)
 
 instance FromJSON StopPassageResponse where
   parseJSON = withObject "StopPassageResponse" $ \js -> let
