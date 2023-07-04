@@ -270,7 +270,7 @@ instance ToHtml StopPage where
             , tripId = TripId tripId
             , routeId = RouteId routeId
             , vehicleId
-            , patternId = PatternId patternId
+            , patternId = Just (PatternId patternId)
             , isDeleted
             , direction
             , lastModified = MillisTimestamp lastModified
@@ -745,7 +745,7 @@ data Passage = Passage
   , routeId :: RouteId
   , stopId :: StopId
   , vehicleId :: Maybe VehicleId
-  , patternId :: PatternId
+  , patternId :: Maybe PatternId
   , isDeleted :: Bool
   , direction :: Integer
   , lastModified :: MillisTimestamp
@@ -773,7 +773,7 @@ instance FromJSON Passage where
     (Duid routeId) <- js .: "route_duid"
     (Duid stopId) <- js .: "stop_point_duid"
     vehicleId <- (fmap . fmap) unDuid (js .:? "vehicle_duid")
-    (Duid patternId) <- js .: "pattern_duid"
+    patternId <- (fmap . fmap) unDuid (js .:? "pattern_duid")
     arrival <- js .:? "arrival_data"
     departure <- js .:? "departure_data"
     congestionLevel <- js .:? "congestion_level"
