@@ -74,7 +74,7 @@ import Servant (throwError)
 import Servant.Server (Handler, Server, serve, err404)
 import Servant.API ((:>), (:<|>)(..), QueryParam, Get, JSON, ToHttpApiData(..), MimeUnrender (..), Accept (..), Capture, FromHttpApiData, parseQueryParam)
 import Servant.HTML.Lucid (HTML)
-import Servant.Client (ClientM, client, runClientM, mkClientEnv, Scheme(..), BaseUrl(..))
+import Servant.Client (ClientM, client, runClientM, mkClientEnv, Scheme(..), BaseUrl(..), ClientError (ConnectionError))
 import Control.Monad.IO.Class (liftIO)
 import Data.Char (isDigit)
 import GHC.Conc (TVar, readTVarIO, readTVar, writeTVar, newTVarIO, newTVar, forkIO, atomically, threadDelay)
@@ -90,24 +90,34 @@ callStopPassage = do
     _ -> putStrLn "Timeout while calling stopPassage"
 
 getStopPassages :: Maybe Manager -> Either StopId TripId -> IO (Maybe StopPassageResponse)
-getStopPassages Nothing stopOrTripId = ignoringTimeouts do
+getStopPassages Nothing stopOrTripId = do
   manager <- newManager tlsManagerSettings
   result <- runClientM (stopPassage
                         (either Just (const Nothing) stopOrTripId)
                         (either (const Nothing) Just stopOrTripId))
                         (mkClientEnv manager (BaseUrl Https "buseireann.ie" 443 ""))
-  pure (either (error . ("Failed to get bus stop passages: " <>) . show) Prelude.id result)
-getStopPassages (Just manager) stopOrTripId = ignoringTimeouts do
-  result <- runClientM (stopPassage
+  case result of
+    Left e -> do
+      putStrLn "Failed to get bus stop passages: "
+      print e
+      return Nothing
+    Right r -> return (Just r)
+getStopPassages (Just manager) stopOrTripId = ignoringTimeouts
+  (runClientM (stopPassage
                         (either Just (const Nothing) stopOrTripId)
                         (either (const Nothing) Just stopOrTripId))
-                                    (mkClientEnv manager (BaseUrl Https "buseireann.ie" 443 ""))
-  pure (either (error . ("Failed to get bus stop passages: " <>) . show) Prelude.id result)
+                                    (mkClientEnv manager (BaseUrl Https "buseireann.ie" 443 "")))
 
-ignoringTimeouts :: IO a -> IO (Maybe a)
-ignoringTimeouts = fmap Just >>> handle \case
-  e@(HttpExceptionRequest _ ResponseTimeout) -> return Nothing
-  e -> throw e
+ignoringTimeouts :: IO (Either ClientError a) -> IO (Maybe a)
+ignoringTimeouts f = do
+  r <- f
+  case r of
+    Left (ConnectionError e) ->
+      case fromException e of
+        Just (HttpExceptionRequest _ ResponseTimeout) -> return Nothing
+        _ -> error ("Request error: " <> show e)
+    Left e -> error ("Request error: " <> show e)
+    Right r -> return (Just r)
 
 callStopPoints :: IO ()
 callStopPoints = do
@@ -118,12 +128,10 @@ callStopPoints = do
 getStopPoints :: Maybe Manager -> IO (Maybe BusStopPoints)
 getStopPoints Nothing = ignoringTimeouts do
   manager <- newManager tlsManagerSettings
-  result <- runClientM stopPoints (mkClientEnv manager (BaseUrl Https "buseireann.ie" 443 ""))
-  pure (either (error . ("Failed to get bus stop points: " <>) . show) Prelude.id result)
+  runClientM stopPoints (mkClientEnv manager (BaseUrl Https "buseireann.ie" 443 ""))
 getStopPoints (Just manager) = ignoringTimeouts do
   manager <- newManager tlsManagerSettings
-  result <- runClientM stopPoints (mkClientEnv manager (BaseUrl Https "buseireann.ie" 443 ""))
-  pure (either (error . ("Failed to get bus stop points: " <>) . show) Prelude.id result)
+  runClientM stopPoints (mkClientEnv manager (BaseUrl Https "buseireann.ie" 443 ""))
 
 makeStopPointsHtml :: IO ()
 makeStopPointsHtml = do
@@ -138,11 +146,10 @@ makeStopPointsHtml = do
 getRoutes :: IO (Maybe Routes)
 getRoutes = ignoringTimeouts do
   manager <- newManager tlsManagerSettings
-  result <- runClientM routesEndpoint (mkClientEnv manager (BaseUrl Https "buseireann.ie" 443 ""))
-  pure (either (error . ("Failed to get routes: " <>) . show) Prelude.id result)
+  runClientM routesEndpoint (mkClientEnv manager (BaseUrl Https "buseireann.ie" 443 ""))
 
-getRouteStopMap :: IO (Maybe (Map RouteId (Set BusStop)))
-getRouteStopMap = ignoringTimeouts do
+getRouteStopMap :: IO (Map RouteId (Set BusStop))
+getRouteStopMap = do
   manager <- newManager tlsManagerSettings
   stopsResponse <- getStopPoints (Just manager)
   case stopsResponse of
