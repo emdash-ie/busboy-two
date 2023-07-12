@@ -115,8 +115,12 @@ ignoringTimeouts f = do
     Left (ConnectionError e) ->
       case fromException e of
         Just (HttpExceptionRequest _ ResponseTimeout) -> return Nothing
-        _ -> error ("Request error: " <> show e)
-    Left e -> error ("Request error: " <> show e)
+        _ -> do
+          putStrLn ("ConnectionError: " <> show e)
+          return Nothing
+    Left e -> do
+      putStrLn ("Other ClientError: " <> show e)
+      return Nothing
     Right r -> return (Just r)
 
 callStopPoints :: IO ()
