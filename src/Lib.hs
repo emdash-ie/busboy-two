@@ -23,6 +23,7 @@ module Lib
     , writeRouteStopMaps
     ) where
 
+import Colog
 import Control.Applicative (liftA2)
 import Control.Category ((>>>))
 import Control.Concurrent.Async (mapConcurrently)
@@ -592,8 +593,8 @@ busboyAPI = Proxy
 busboyApp :: ServerState -> Application
 busboyApp = serve busboyAPI . busboyServer
 
-runBusboyApp :: FilePath -> IO ()
-runBusboyApp databasePath = do
+runBusboyApp :: FilePath -> LogAction IO Text -> IO ()
+runBusboyApp databasePath logToFile = do
   forkIO (SQLite.withConnection databasePath (\connection -> do
     let managerSettings = tlsManagerSettings
           { managerModifyRequest = \r -> return (r {responseTimeout = responseTimeoutMicro 10000000}) -- 10 seconds
@@ -601,6 +602,8 @@ runBusboyApp databasePath = do
     manager <- newManager managerSettings
     Database.createTables connection
     let loop f = do
+          now <- getCurrentTime
+          logToFile <& ("Looping at " <> Text.pack (show now))
           f
           threadDelay 10000000 -- 10 seconds
           loop f

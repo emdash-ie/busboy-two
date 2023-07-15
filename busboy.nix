@@ -1,4 +1,4 @@
-{ mkDerivation, aeson, async, base, bytestring, containers
+{ mkDerivation, aeson, async, base, bytestring, co-log, containers
 , generic-lens, http-client, http-client-tls, lens, lib, lucid
 , optparse-applicative, scientific, servant, servant-client
 , servant-lucid, servant-server, sqlite-simple, text, time, vector
@@ -11,14 +11,14 @@ mkDerivation {
   isLibrary = true;
   isExecutable = true;
   libraryHaskellDepends = [
-    aeson async base bytestring containers generic-lens http-client
-    http-client-tls lens lucid scientific servant servant-client
-    servant-lucid servant-server sqlite-simple text time vector wai
-    warp
+    aeson async base bytestring co-log containers generic-lens
+    http-client http-client-tls lens lucid scientific servant
+    servant-client servant-lucid servant-server sqlite-simple text time
+    vector wai warp
   ];
   executableHaskellDepends = [
-    aeson base bytestring containers http-client http-client-tls lucid
-    optparse-applicative scientific servant servant-client
+    aeson base bytestring co-log containers http-client http-client-tls
+    lucid optparse-applicative scientific servant servant-client
     servant-lucid servant-server text time vector wai warp
   ];
   testHaskellDepends = [
