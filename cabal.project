@@ -1,2 +1,4 @@
 packages: busboy.cabal
 optimization: 2
+profiling: true
+profiling-detail: all-functions
