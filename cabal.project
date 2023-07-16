@@ -1,0 +1,2 @@
+packages: busboy.cabal
+optimization: 2
