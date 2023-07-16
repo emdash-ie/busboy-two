@@ -81,6 +81,7 @@ import Data.Char (isDigit)
 import GHC.Conc (TVar, readTVarIO, readTVar, writeTVar, newTVarIO, newTVar, forkIO, atomically, threadDelay)
 
 import qualified Database
+import System.IO
 
 callStopPassage :: IO ()
 callStopPassage = do
@@ -593,8 +594,9 @@ busboyAPI = Proxy
 busboyApp :: ServerState -> Application
 busboyApp = serve busboyAPI . busboyServer
 
-runBusboyApp :: FilePath -> LogAction IO Text -> IO ()
-runBusboyApp databasePath logToFile = do
+runBusboyApp :: FilePath -> FilePath -> IO ()
+runBusboyApp databasePath logPath = withFile logPath AppendMode \logHandle -> do
+  let log = logTextHandle logHandle <> logFlush logHandle
   forkIO (SQLite.withConnection databasePath (\connection -> do
     let managerSettings = tlsManagerSettings
           { managerModifyRequest = \r -> return (r {responseTimeout = responseTimeoutMicro 10000000}) -- 10 seconds
@@ -603,7 +605,7 @@ runBusboyApp databasePath logToFile = do
     Database.createTables connection
     let loop f = do
           now <- getCurrentTime
-          logToFile <& ("Looping at " <> Text.pack (show now))
+          log <& ("Looping at " <> Text.pack (show now))
           f
           threadDelay 10000000 -- 10 seconds
           loop f

@@ -2,7 +2,6 @@ module Main where
 
 import Lib
 
-import Colog
 import Options.Applicative
 import Data.Aeson (encodeFile)
 
@@ -10,7 +9,7 @@ main :: IO ()
 main = do
   command <- execParser (info commandParser (progDesc "Busboy data collector"))
   case command of
-    RunBusboyApp databasePath logFile -> withLogTextFile logFile (runBusboyApp databasePath)
+    RunBusboyApp databasePath logFile -> runBusboyApp databasePath logFile
     GetRouteStopMap outFile -> writeRouteStopMaps outFile
 
 commandParser :: Parser Command
