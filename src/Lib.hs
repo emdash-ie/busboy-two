@@ -524,10 +524,16 @@ collectData manager connection = do
           Just (StopPassageResponse tripPassages) -> do
             now <- getCurrentTime
             let retrievedAt = now
-            mostRecentPredictions :: Map (PassageId, StopId) Prediction <- fmap (Map.fromListWith (maxBy (comparing (^. field @"retrievedAt")))
+            mostRecentPredictions :: Map (PassageId, StopId) Prediction <- fmap (Map.fromList
                                           . fmap (\p@Prediction{passageId, stopId} -> ((passageId, stopId), p)))
                                      (SQLite.query_ connection
-                                     "select * from predictions" :: IO [Prediction])
+                                     "select retrievedAt, passageId, stopId, lastModified, \
+                                     \   scheduledArrivalTime, actualOrEstimatedArrivalTime, \
+                                     \   scheduledDepartureTime, actualOrEstimatedDepartureTime from \
+                                     \ (select *, \
+                                     \   row_number() over (partition by passageId, stopId order by retrievedAt desc) ranked_order \
+                                     \ from predictions) \
+                                     \ where ranked_order = 1;" :: IO [Prediction])
             let predictionsToInsert :: [Prediction] = Vector.toList tripPassages &
                   mapMaybe (\p@Passage{..} -> do
                     let passageId = id
@@ -553,13 +559,16 @@ collectData manager connection = do
             SQLite.executeMany connection "insert into predictions values (?, ?, ?, ?, ?, ?, ?, ?)" predictionsToInsert
             let passageInfo :: [PassageInfo] = Vector.toList tripPassages &
                   fmap (\Passage{..} -> PassageInfo{..})
-            mostRecentPassageInfo <- fmap (Map.fromListWith (maxBy (comparing (^. _1)))
-                                           . fmap (\(a, b, c, d, e, f) -> (a, (b, c, d, e, f))))
+            mostRecentPassageInfo <- fmap (Map.fromList
+                                           . fmap (\(a, b, c, d, e, f, g) -> (a, (b, c, d, e, f))))
                                      (SQLite.query_ connection
               -- need rest of row though
-              " select * \
-              \ from passages \
-              \ " :: IO [(PassageId, UTCTime, TripId, RouteId, StopId, Maybe VehicleId)])
+              " select * from \
+              \ (select *, \
+              \   row_number() over (partition by id order by retrievedAt desc) ranked_order \
+              \ from passages) \
+              \ where ranked_order = 1; \
+              \ " :: IO [(PassageId, UTCTime, TripId, RouteId, StopId, Maybe VehicleId, Integer)])
             for_ passageInfo \pi -> do
               when (maybe True
                      (\(t, tId, rId, sId, vId) ->
@@ -570,11 +579,6 @@ collectData manager connection = do
                      (Map.lookup (pi ^. field @"id") mostRecentPassageInfo)
                    )
                 (SQLite.execute connection "insert into passages values (?, ?, ?, ?, ?, ?)" pi) -- should be an upsert?
-
-maxBy :: (a -> a -> Ordering) -> a -> a -> a
-maxBy f x y = case f x y of
-  LT -> y
-  _ -> x
 
 dataCollectorApp :: TVar DataCollectorState -> Application
 dataCollectorApp =
