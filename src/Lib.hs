@@ -54,7 +54,7 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Lazy as LazyText
 import Data.Text.Lazy.Encoding (encodeUtf8, decodeUtf8)
-import Data.Time.Clock (UTCTime, secondsToNominalDiffTime, getCurrentTime, addUTCTime, nominalDay)
+import Data.Time.Clock (UTCTime, secondsToNominalDiffTime, getCurrentTime, addUTCTime, nominalDay, diffUTCTime)
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Data.Vector (Vector)
 import Data.Vector.Lens (toVectorOf)
@@ -473,8 +473,16 @@ instance SQLite.ToRow PassageInfo where
     , SQLite.toField (coerce vehicleId :: Maybe Text)
     ]
 
-collectData :: Manager -> SQLite.Connection -> IO ()
-collectData manager connection = do
+timeAction :: LogAction IO Text -> Text -> IO a -> IO a
+timeAction log name io = do
+  before <- getCurrentTime
+  r <- io
+  after <- getCurrentTime
+  log <& (name <> ": " <> Text.pack (show (diffUTCTime after before)))
+  return r
+
+collectData :: LogAction IO Text -> Manager -> SQLite.Connection -> IO ()
+collectData log manager connection = do
   -- for each stop on the 220 route:
   -- - poll the stopPassage endpoint
   -- - save retrieved info into the state variable
@@ -501,22 +509,26 @@ collectData manager connection = do
                            , retrievedAt
                            })
             & Set.fromList
-      oldVehicleInfo <- fmap Set.fromList (SQLite.query_ connection
-        "select vehicleId, isAccessible, hasBikeRack \
-        \ from vehicles \
-        \ order by retrievedAt desc "
-        :: IO [(Text, Maybe Bool, Maybe Bool)])
-      for_ vehicleInfo \vi -> do
-        unless (( vi ^. field @"vehicleId" . to coerce
-              , vi ^. field @"isAccessible"
-              , vi ^. field @"hasBikeRack"
-              ) `Set.member` oldVehicleInfo)
-          (SQLite.execute connection "insert into vehicles values (?, ?, ?, ?)" vi)
+      oldVehicleInfo <- timeAction log "select vehicles"
+        (fmap Set.fromList (SQLite.query_ connection
+          "select vehicleId, isAccessible, hasBikeRack \
+          \ from vehicles \
+          \ order by retrievedAt desc "
+          :: IO [(Text, Maybe Bool, Maybe Bool)]))
+      timeAction log "insert vehicles"
+        (for_ vehicleInfo \vi -> do
+          unless (( vi ^. field @"vehicleId" . to coerce
+                , vi ^. field @"isAccessible"
+                , vi ^. field @"hasBikeRack"
+                ) `Set.member` oldVehicleInfo)
+            (timeAction log "insert vehicles (inner)"
+             (SQLite.execute connection "insert into vehicles values (?, ?, ?, ?)" vi)))
       let locations :: [Location] = Vector.toList passages &
             mapMaybe (\Passage{..} -> do
                          vehicleId' <- vehicleId
                          return Location{vehicleId = vehicleId', ..})
-      SQLite.executeMany connection "insert into locations values (?, ?, ?, ?, ?, ?, ?, ?)" locations
+      timeAction log "insert locations"
+        (SQLite.executeMany connection "insert into locations values (?, ?, ?, ?, ?, ?, ?, ?)" locations)
       for_ tripIds \trip -> do
         tripResponse <- liftIO (getStopPassages (Just manager) (Right trip))
         case tripResponse of
@@ -526,14 +538,15 @@ collectData manager connection = do
             let retrievedAt = now
             mostRecentPredictions :: Map (PassageId, StopId) Prediction <- fmap (Map.fromList
                                           . fmap (\p@Prediction{passageId, stopId} -> ((passageId, stopId), p)))
-                                     (SQLite.query_ connection
-                                     "select retrievedAt, passageId, stopId, lastModified, \
-                                     \   scheduledArrivalTime, actualOrEstimatedArrivalTime, \
-                                     \   scheduledDepartureTime, actualOrEstimatedDepartureTime from \
-                                     \ (select *, \
-                                     \   row_number() over (partition by passageId, stopId order by retrievedAt desc) ranked_order \
-                                     \ from predictions) \
-                                     \ where ranked_order = 1;" :: IO [Prediction])
+                                     (timeAction log "select predictions"
+                                      (SQLite.query_ connection
+                                       "select retrievedAt, passageId, stopId, lastModified, \
+                                       \   scheduledArrivalTime, actualOrEstimatedArrivalTime, \
+                                       \   scheduledDepartureTime, actualOrEstimatedDepartureTime from \
+                                       \ (select *, \
+                                       \   row_number() over (partition by passageId, stopId order by retrievedAt desc) ranked_order \
+                                       \ from predictions) \
+                                       \ where ranked_order = 1;" :: IO [Prediction]))
             let predictionsToInsert :: [Prediction] = Vector.toList tripPassages &
                   mapMaybe (\p@Passage{..} -> do
                     let passageId = id
@@ -556,10 +569,11 @@ collectData manager connection = do
                            ((passageSubfields prediction /=) . passageSubfields)
                            (Map.lookup (passageId, stopId) mostRecentPredictions))
                     return Prediction{..})
-            SQLite.executeMany connection "insert into predictions values (?, ?, ?, ?, ?, ?, ?, ?)" predictionsToInsert
+            timeAction log "insert predictions"
+              (SQLite.executeMany connection "insert into predictions values (?, ?, ?, ?, ?, ?, ?, ?)" predictionsToInsert)
             let passageInfo :: [PassageInfo] = Vector.toList tripPassages &
                   fmap (\Passage{..} -> PassageInfo{..})
-            mostRecentPassageInfo <- fmap (Map.fromList
+            mostRecentPassageInfo <- timeAction log "select passages" (fmap (Map.fromList
                                            . fmap (\(a, b, c, d, e, f, g) -> (a, (b, c, d, e, f))))
                                      (SQLite.query_ connection
               -- need rest of row though
@@ -568,17 +582,19 @@ collectData manager connection = do
               \   row_number() over (partition by id order by retrievedAt desc) ranked_order \
               \ from passages) \
               \ where ranked_order = 1; \
-              \ " :: IO [(PassageId, UTCTime, TripId, RouteId, StopId, Maybe VehicleId, Integer)])
-            for_ passageInfo \pi -> do
-              when (maybe True
-                     (\(t, tId, rId, sId, vId) ->
-                        (tId, rId, sId, vId)
-                          /= (pi ^. field @"tripId", pi ^. field @"routeId"
-                             , pi ^. field @"stopId", pi ^. field @"vehicleId")
-                        || (t < addUTCTime (negate nominalDay) (pi ^. field @"retrievedAt")))
-                     (Map.lookup (pi ^. field @"id") mostRecentPassageInfo)
-                   )
-                (SQLite.execute connection "insert into passages values (?, ?, ?, ?, ?, ?)" pi) -- should be an upsert?
+              \ " :: IO [(PassageId, UTCTime, TripId, RouteId, StopId, Maybe VehicleId, Integer)]))
+            timeAction log "insert passages"
+              (for_ passageInfo \pi -> do
+                when (maybe True
+                       (\(t, tId, rId, sId, vId) ->
+                          (tId, rId, sId, vId)
+                            /= (pi ^. field @"tripId", pi ^. field @"routeId"
+                               , pi ^. field @"stopId", pi ^. field @"vehicleId")
+                          || (t < addUTCTime (negate nominalDay) (pi ^. field @"retrievedAt")))
+                       (Map.lookup (pi ^. field @"id") mostRecentPassageInfo)
+                     )
+                  (timeAction log "insert passages (inner)"
+                   (SQLite.execute connection "insert into passages values (?, ?, ?, ?, ?, ?)" pi))) -- should be an upsert?
 
 dataCollectorApp :: TVar DataCollectorState -> Application
 dataCollectorApp =
@@ -613,7 +629,7 @@ runBusboyApp databasePath logPath = withFile logPath AppendMode \logHandle -> do
           f
           threadDelay 10000000 -- 10 seconds
           loop f
-    loop (collectData manager connection)))
+    loop (collectData log manager connection)))
   var <- newTVarIO Map.empty
   run 9998 (busboyApp (ServerState var))
 
