@@ -522,8 +522,7 @@ collectData log manager connection = do
                   , vi ^. field @"isAccessible"
                   , vi ^. field @"hasBikeRack"
                   ) `Set.member` oldVehicleInfo)
-              (timeAction log "insert vehicles (inner)"
-               (SQLite.execute connection "insert into vehicles values (?, ?, ?, ?)" vi)))
+              (SQLite.execute connection "insert into vehicles values (?, ?, ?, ?)" vi))
         let locations :: [Location] = Vector.toList passages &
               mapMaybe (\Passage{..} -> do
                            vehicleId' <- vehicleId
@@ -596,8 +595,7 @@ collectData log manager connection = do
                             || (t < addUTCTime (negate nominalDay) (pi ^. field @"retrievedAt")))
                          (Map.lookup (pi ^. field @"id") mostRecentPassageInfo)
                        )
-                    (timeAction log "insert passages (inner)"
-                     (SQLite.execute connection "insert into passages values (?, ?, ?, ?, ?, ?)" pi))) -- should be an upsert?
+                    (SQLite.execute connection "insert into passages values (?, ?, ?, ?, ?, ?)" pi)) -- should be an upsert?
 
 dataCollectorApp :: TVar DataCollectorState -> Application
 dataCollectorApp =
