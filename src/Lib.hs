@@ -515,14 +515,15 @@ collectData log manager connection = do
           \ from vehicles \
           \ order by retrievedAt desc "
           :: IO [(Text, Maybe Bool, Maybe Bool)]))
-      timeAction log "insert vehicles"
-        (for_ vehicleInfo \vi -> do
-          unless (( vi ^. field @"vehicleId" . to coerce
-                , vi ^. field @"isAccessible"
-                , vi ^. field @"hasBikeRack"
-                ) `Set.member` oldVehicleInfo)
-            (timeAction log "insert vehicles (inner)"
-             (SQLite.execute connection "insert into vehicles values (?, ?, ?, ?)" vi)))
+      SQLite.withTransaction connection do
+        timeAction log "insert vehicles"
+          (for_ vehicleInfo \vi -> do
+            unless (( vi ^. field @"vehicleId" . to coerce
+                  , vi ^. field @"isAccessible"
+                  , vi ^. field @"hasBikeRack"
+                  ) `Set.member` oldVehicleInfo)
+              (timeAction log "insert vehicles (inner)"
+               (SQLite.execute connection "insert into vehicles values (?, ?, ?, ?)" vi)))
       let locations :: [Location] = Vector.toList passages &
             mapMaybe (\Passage{..} -> do
                          vehicleId' <- vehicleId
@@ -570,7 +571,8 @@ collectData log manager connection = do
                            (Map.lookup (passageId, stopId) mostRecentPredictions))
                     return Prediction{..})
             timeAction log "insert predictions"
-              (SQLite.executeMany connection "insert into predictions values (?, ?, ?, ?, ?, ?, ?, ?)" predictionsToInsert)
+              (SQLite.withTransaction connection
+               (SQLite.executeMany connection "insert into predictions values (?, ?, ?, ?, ?, ?, ?, ?)" predictionsToInsert))
             let passageInfo :: [PassageInfo] = Vector.toList tripPassages &
                   fmap (\Passage{..} -> PassageInfo{..})
             mostRecentPassageInfo <- timeAction log "select passages" (fmap (Map.fromList
