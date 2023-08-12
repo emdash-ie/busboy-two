@@ -545,8 +545,11 @@ collectData log manager connection = do
                                          \   scheduledArrivalTime, actualOrEstimatedArrivalTime, \
                                          \   scheduledDepartureTime, actualOrEstimatedDepartureTime from \
                                          \ (select *, \
-                                         \   row_number() over (partition by passageId, stopId order by retrievedAt desc) ranked_order \
-                                         \ from predictions) \
+                                         \   row_number() over \
+                                         \     (partition by passageId, predictions.stopId order by predictions.retrievedAt desc) \
+                                         \     ranked_order \
+                                         \ from predictions join passages on predictions.passageId = passages.id \
+                                         \   where passages.tripId = ?) \
                                          \ where ranked_order = 1;" :: IO [Prediction]))
               let predictionsToInsert :: [Prediction] = Vector.toList tripPassages &
                     mapMaybe (\p@Passage{..} -> do
