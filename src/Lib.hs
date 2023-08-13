@@ -540,7 +540,7 @@ collectData log manager connection = do
               mostRecentPredictions :: Map (PassageId, StopId) Prediction <- fmap (Map.fromList
                                             . fmap (\p@Prediction{passageId, stopId} -> ((passageId, stopId), p)))
                                        (timeAction log "select predictions"
-                                        (SQLite.query_ connection
+                                        (SQLite.query connection
                                          "select retrievedAt, passageId, stopId, lastModified, \
                                          \   scheduledArrivalTime, actualOrEstimatedArrivalTime, \
                                          \   scheduledDepartureTime, actualOrEstimatedDepartureTime from \
@@ -550,7 +550,7 @@ collectData log manager connection = do
                                          \     ranked_order \
                                          \ from predictions join passages on predictions.passageId = passages.id \
                                          \   where passages.tripId = ?) \
-                                         \ where ranked_order = 1;" :: IO [Prediction]))
+                                         \ where ranked_order = 1;" [unTripId trip] :: IO [Prediction]))
               let predictionsToInsert :: [Prediction] = Vector.toList tripPassages &
                     mapMaybe (\p@Passage{..} -> do
                       let passageId = id
@@ -580,14 +580,15 @@ collectData log manager connection = do
             SQLite.withTransaction connection do
               mostRecentPassageInfo <- timeAction log "select passages" (fmap (Map.fromList
                                              . fmap (\(a, b, c, d, e, f, g) -> (a, (b, c, d, e, f))))
-                                       (SQLite.query_ connection
+                                       (SQLite.query connection
                 -- need rest of row though
                 " select * from \
                 \ (select *, \
                 \   row_number() over (partition by id order by retrievedAt desc) ranked_order \
-                \ from passages) \
+                \ from passages \
+                \   where tripId = ?) \
                 \ where ranked_order = 1; \
-                \ " :: IO [(PassageId, UTCTime, TripId, RouteId, StopId, Maybe VehicleId, Integer)]))
+                \ " [unTripId trip] :: IO [(PassageId, UTCTime, TripId, RouteId, StopId, Maybe VehicleId, Integer)]))
               timeAction log "insert passages"
                 (for_ passageInfo \pi -> do
                   when (maybe True
