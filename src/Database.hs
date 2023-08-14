@@ -6,6 +6,7 @@ import Database.SQLite.Simple
 createTables :: Connection -> IO ()
 createTables connection = do
   execute_ connection createPredictionTable
+  execute_ connection createPredictionTripIdIndex
   execute_ connection createLocationTable
   execute_ connection createVehiclesTable
   execute_ connection createPassagesTable
@@ -16,6 +17,7 @@ createPredictionTable =
   \ ( retrievedAt text \
   \ , passageId text \
   \ , stopId text \
+  \ , tripId text \
   \ , lastModified text \
   \ , scheduledArrivalTime text null \
   \ , actualOrEstimatedArrivalTime text null \
@@ -23,6 +25,10 @@ createPredictionTable =
   \ , actualOrEstimatedDepartureTime text null \
   \ , primary key (retrievedAt, passageId, stopId) \
   \ )"
+
+createPredictionTripIdIndex :: Query
+createPredictionTripIdIndex =
+  "create index if not exists predictionsTripId on predictions (tripId)"
 
 createLocationTable :: Query
 createLocationTable =

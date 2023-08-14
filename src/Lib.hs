@@ -376,6 +376,7 @@ data Prediction = Prediction
   { retrievedAt :: UTCTime
   , passageId :: PassageId
   , stopId :: StopId
+  , tripId :: TripId
   , lastModified :: MillisTimestamp
   , scheduledArrivalTime :: Maybe SecondsTimestamp
   , actualOrEstimatedArrivalTime :: Maybe SecondsTimestamp
@@ -388,6 +389,7 @@ instance SQLite.ToRow Prediction where
     [ SQLite.toField retrievedAt
     , SQLText (coerce passageId)
     , SQLText (coerce stopId)
+    , SQLText (coerce tripId)
     , SQLite.toField (coerce lastModified :: UTCTime)
     , SQLite.toField (coerce scheduledArrivalTime :: Maybe UTCTime)
     , SQLite.toField (coerce actualOrEstimatedArrivalTime :: Maybe UTCTime)
@@ -398,6 +400,7 @@ instance SQLite.ToRow Prediction where
 instance SQLite.FromRow Prediction where
   fromRow = Prediction
     <$> SQLite.field
+    <*> SQLite.field
     <*> SQLite.field
     <*> SQLite.field
     <*> SQLite.field
@@ -546,10 +549,10 @@ collectData log manager connection = do
                                          \   scheduledDepartureTime, actualOrEstimatedDepartureTime from \
                                          \ (select *, \
                                          \   row_number() over \
-                                         \     (partition by passageId, predictions.stopId order by predictions.retrievedAt desc) \
+                                         \     (partition by passageId, stopId order by retrievedAt desc) \
                                          \     ranked_order \
-                                         \ from predictions join passages on predictions.passageId = passages.id \
-                                         \   where passages.tripId = ?) \
+                                         \ from predictions \
+                                         \   where tripId = ?) \
                                          \ where ranked_order = 1;" [unTripId trip] :: IO [Prediction]))
               let predictionsToInsert :: [Prediction] = Vector.toList tripPassages &
                     mapMaybe (\p@Passage{..} -> do
@@ -574,7 +577,7 @@ collectData log manager connection = do
                              (Map.lookup (passageId, stopId) mostRecentPredictions))
                       return Prediction{..})
               timeAction log "insert predictions"
-                (SQLite.executeMany connection "insert into predictions values (?, ?, ?, ?, ?, ?, ?, ?)" predictionsToInsert)
+                (SQLite.executeMany connection "insert into predictions values (?, ?, ?, ?, ?, ?, ?, ?, ?)" predictionsToInsert)
             let passageInfo :: [PassageInfo] = Vector.toList tripPassages &
                   fmap (\Passage{..} -> PassageInfo{..})
             SQLite.withTransaction connection do
