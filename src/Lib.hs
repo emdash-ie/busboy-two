@@ -639,7 +639,9 @@ runBusboyApp databasePath logPath = withFile logPath AppendMode \logHandle -> do
           after <- getCurrentTime
           let MkFixed differencePicoseconds = nominalDiffTimeToSeconds (diffUTCTime after before)
           let delayMicroseconds = 10_000_000 - (1_000_000 * differencePicoseconds)
-          when (delayMicroseconds > 0) (threadDelay (fromIntegral delayMicroseconds))
+          when (delayMicroseconds > 0) do
+            log <& ("Delaying for " <> Text.pack (show delayMicroseconds) <> " microseconds")
+            threadDelay (fromIntegral delayMicroseconds)
           loop f
     loop (collectData log manager connection)))
   var <- newTVarIO Map.empty
