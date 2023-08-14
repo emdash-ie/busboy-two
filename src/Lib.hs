@@ -8,6 +8,7 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE NumericUnderscores #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE ScopedTypeVariables #-}
@@ -54,7 +55,7 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Lazy as LazyText
 import Data.Text.Lazy.Encoding (encodeUtf8, decodeUtf8)
-import Data.Time.Clock (UTCTime, secondsToNominalDiffTime, getCurrentTime, addUTCTime, nominalDay, diffUTCTime)
+import Data.Time.Clock (UTCTime, secondsToNominalDiffTime, getCurrentTime, addUTCTime, nominalDay, diffUTCTime, nominalDiffTimeToSeconds)
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Data.Vector (Vector)
 import Data.Vector.Lens (toVectorOf)
@@ -627,15 +628,18 @@ runBusboyApp databasePath logPath = withFile logPath AppendMode \logHandle -> do
   let log = logTextHandle logHandle <> logFlush logHandle
   forkIO (SQLite.withConnection databasePath (\connection -> do
     let managerSettings = tlsManagerSettings
-          { managerModifyRequest = \r -> return (r {responseTimeout = responseTimeoutMicro 10000000}) -- 10 seconds
+          { managerModifyRequest = \r -> return (r {responseTimeout = responseTimeoutMicro 10_000_000}) -- 10 seconds
           }
     manager <- newManager managerSettings
     Database.createTables connection
     let loop f = do
-          now <- getCurrentTime
-          log <& ("Looping at " <> Text.pack (show now))
+          before <- getCurrentTime
+          log <& ("Looping at " <> Text.pack (show before))
           f
-          threadDelay 10000000 -- 10 seconds
+          after <- getCurrentTime
+          let MkFixed differencePicoseconds = nominalDiffTimeToSeconds (diffUTCTime after before)
+          let delayMicroseconds = 10_000_000 - (1_000_000 * differencePicoseconds)
+          when (delayMicroseconds > 0) (threadDelay (fromIntegral delayMicroseconds))
           loop f
     loop (collectData log manager connection)))
   var <- newTVarIO Map.empty
