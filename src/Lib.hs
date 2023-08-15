@@ -177,7 +177,7 @@ getRouteStopMap = do
           batchRoutes :: Vector (Vector RouteId) <- mapConcurrently getRoutes batch
           putStrLn ("Finished batch " <> show n)
           putStrLn "Waiting…"
-          threadDelay 1000000 -- 1 second
+          threadDelay 1_000_000 -- 1 second
           return (rest, batchRoutes)
         getBatches :: Integer -> Vector BusStop -> IO (Vector (Vector RouteId))
         getBatches n stops = do
@@ -216,7 +216,7 @@ writeRouteStopMaps outputFile = do
           mapConcurrently writeRoutes batch
           putStrLn ("Finished batch " <> show n)
           putStrLn "Waiting…"
-          threadDelay 1000000 -- 1 second
+          threadDelay 1_000_000 -- 1 second
           return rest
         writeBatches :: Integer -> Vector BusStop -> IO ()
         writeBatches n stops = do
@@ -623,9 +623,8 @@ busboyAPI = Proxy
 busboyApp :: ServerState -> Application
 busboyApp = serve busboyAPI . busboyServer
 
-runBusboyApp :: FilePath -> FilePath -> IO ()
-runBusboyApp databasePath logPath = withFile logPath AppendMode \logHandle -> do
-  let log = logTextHandle logHandle <> logFlush logHandle
+runBusboyApp :: FilePath -> LogAction IO Text -> IO ()
+runBusboyApp databasePath log = do
   forkIO (SQLite.withConnection databasePath (\connection -> do
     let managerSettings = tlsManagerSettings
           { managerModifyRequest = \r -> return (r {responseTimeout = responseTimeoutMicro 10_000_000}) -- 10 seconds
@@ -669,7 +668,7 @@ queryBusEireann ServerState{ stopData } = do
         writeTVar stopVar (StopData now (foldr f realtimeData passages))
         return stopDataMap
     writeTVar stopData m
-  threadDelay 10000000 -- 10 seconds
+  threadDelay 10_000_000 -- 10 seconds
   queryBusEireann (ServerState stopData)
 
 busboyServer :: ServerState -> Server BusboyAPI
@@ -737,7 +736,7 @@ instance FromJSON MillisTimestamp where
           <> show f
       Right i ->
         pure (MillisTimestamp (posixSecondsToUTCTime
-          (secondsToNominalDiffTime (MkFixed (1000000000 * i)))))
+          (secondsToNominalDiffTime (MkFixed (1_000_000_000 * i)))))
 
 newtype SecondsTimestamp = SecondsTimestamp {unSecondsTimestamp :: UTCTime}
   deriving (Show, Eq, Ord)
