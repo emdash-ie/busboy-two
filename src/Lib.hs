@@ -545,7 +545,7 @@ collectData log manager connection = do
                                             . fmap (\p@Prediction{passageId, stopId} -> ((passageId, stopId), p)))
                                        (timeAction log "select predictions"
                                         (SQLite.query connection
-                                         "select retrievedAt, passageId, stopId, lastModified, \
+                                         "select retrievedAt, passageId, stopId, tripId, lastModified, \
                                          \   scheduledArrivalTime, actualOrEstimatedArrivalTime, \
                                          \   scheduledDepartureTime, actualOrEstimatedDepartureTime from \
                                          \ (select *, \
